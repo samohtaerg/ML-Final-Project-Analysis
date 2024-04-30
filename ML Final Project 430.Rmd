@@ -1,0 +1,267 @@
+---
+title: "ML Final Project 430"
+author: "AC"
+output:  
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      warnings = FALSE, fig.align = 'center',  eval = TRUE)
+```
+
+
+```{r}
+library(caret)
+library(pROC)
+library(tidyverse)
+library(ggcorrplot)
+library("FactoMineR")
+library('corrr')
+library(factoextra)
+library(haven)
+```
+
+## load the data
+
+```{r}
+nhanes_data <- read_dta("NHANES_dataset_Analysis_Project.dta")
+depression_data <- read_dta("Depression_data.dta")
+#merged_data <- merge(nhanes_data, depression_data, by = "seqn", all = TRUE)
+merged_data <- nhanes_data%>%
+  inner_join(depression_data)
+```
+
+## The dataset will be filtered to focus on the target population of females aged 30−55 years old. 
+
+```{r}
+#The dataset will be filtered to focus on the target population of females aged 30−55 years old.
+Target_data<- merged_data%>%
+  filter(riagendr==2, between(ridageyr,20,65))
+```
+
+```{r}
+#Replace 99 with NA
+Target_data <- Target_data %>%
+  mutate(across(seqn:dpq090, ~ifelse(. %in% c(99, 77), NA, .)))
+
+#Missing data percentages will be calculated for each variable, and those with high missingness will be dropped
+missing_percentages <- colMeans(is.na(Target_data)) * 100
+missing_percentages <- sort(missing_percentages, decreasing = TRUE)
+print(missing_percentages)
+```
+
+```{r}
+Target_data<- Target_data%>%
+  dplyr::select(-c(names(which(missing_percentages>10)),
+                   'seqn', 'riagendr','ridstatr'))%>%
+  drop_na()
+  #mutate(across(where(is.numeric), ~replace_na(., median(., na.rm=TRUE))))
+```
+
+```{r}
+# principal component analysis (PCA) will be explored as an alternative for feature extraction
+Target_data_normalized <- Target_data
+Target_data_normalized$ridageyr<- scale(Target_data_normalized$ridageyr)
+Target_data_normalized$bmxbmi<- scale(Target_data_normalized$bmxbmi)
+head(Target_data_normalized)
+
+#correlation 
+library(ggcorrplot)
+corr_matrix <- cor(Target_data_normalized)
+ggcorrplot(corr_matrix)
+
+w <- which(abs(corr_matrix)>0.8 & row(corr_matrix)<col(corr_matrix), arr.ind=TRUE)
+## reconstruct names from positions
+high_cor <- matrix(colnames(corr_matrix)[w],ncol=2)
+high_cor
+
+#Apply PCA
+data.pca <- princomp(corr_matrix)
+summary(data.pca)
+```
+```{r}
+# Contribution of each variable 
+library("FactoMineR")
+library('corrr')
+library(factoextra)
+fviz_cos2(data.pca, choice = "var", axes = 1:2)
+
+#vaitables to remove 
+var_remove<-  c('ridageyr','bmxbmi','ridreth3')
+```
+```{r}
+#Final data 
+# The binary depression variable will sum scores from 9 questionnaire items (dpq010 to dpq090)
+df<- Target_data%>%
+  dplyr::select(-var_remove)%>%
+  mutate(target= rowSums(dplyr::select(., starts_with("dpq0"))),
+         target= ifelse(target>=10,1,0)
+         )%>%
+  dplyr::select(-starts_with('dpq0'))
+head(df)
+
+table(df$target)
+```
+```{r}
+summary(df)
+```
+
+```{r}
+library(ROSE)
+
+#In the training phase, the dataset will be randomly split into training (70%) and testing (30%) sets using holdout validation
+# Randomly split the data into training (70%) and testing (30%) sets
+set.seed(1234)
+train_index <- sample(1:nrow(df), 0.7 * nrow(df))
+train_data <- df[train_index, ]
+test_data <- df[-train_index, ]
+target<-  as.factor(test_data$target)
+test_data$target<-NULL
+
+trainrose<-ROSE(target~.,data=train_data)$data
+table(trainrose$target)
+train_data<- trainrose
+```
+
+```{r}
+# logistic regression, decision trees, random forests, and XGBoost models
+
+# Set up Repeated k-fold Cross Validation
+train_control <- trainControl(method="repeatedcv", 
+                              number=10, repeats = 3)
+
+#logistic model 
+# Fit a logistic regression model
+fit <- train(target~ ., 
+             data = train_data, 
+             method = "glm", 
+             family = "binomial",
+             trControl = train_control)
+#predict the model
+fit.probs<- predict(fit, test_data, type = "raw")
+fit.pred <- as.factor(ifelse(fit.probs> 0.5, 1, 0))
+#test_data$target<- as.factor(test_data$target)
+# Set the same levels for both factors
+levels(fit.pred) <- levels(target)
+
+# Evaluate the model on the test set using confusion matrix
+fit.con<-confusionMatrix(fit.pred, target)
+
+#Auc
+fit.auc= auc(target, fit.probs)[1]
+```
+```{r}
+# decision trees
+d.tree = train(target~ ., 
+               data = train_data, 
+                  method="rpart", 
+               trControl = train_control)
+
+d.tree.probs = predict(d.tree, newdata = test_data)
+d.tree.pred <- as.factor(ifelse(d.tree.probs> 0.5, 1, 0))
+
+# Set the same levels for both factors
+levels(d.tree.pred ) <- levels(target)
+
+# Evaluate the model on the test set using confusion matrix
+dt.con<-confusionMatrix(d.tree.pred, target)
+
+#Auc
+dt.auc= auc(target, d.tree.probs)[1]
+```
+
+```{r}
+## random forest
+rf_default <- train(target~., 
+                    data = train_data, 
+                    method='rf', 
+                    trControl = train_control)
+
+rf.probs = predict(rf_default, newdata = test_data)
+rf.pred <- as.factor(ifelse(rf.probs > 0.5, 1, 0))
+
+# Set the same levels for both factors
+levels(rf.pred) <- levels(target)
+# Evaluate the model on the test set using confusion matrix
+rf.conf<-confusionMatrix(rf.pred, target)
+
+#Auc
+rf.auc= auc(target, rf.probs)[1]
+```
+
+```{r}
+#  XGBoost
+xgb_base <- train(target~., 
+                    data = train_data, 
+                   method = "xgbTree", 
+                    trControl = train_control,
+                  verbosity = 0)
+
+###
+xgb.probs = predict(xgb_base, test_data)
+xgb.pred <- as.factor(ifelse(xgb.probs > 0.5, 1, 0))
+
+# Set the same levels for both factors
+levels(xgb.pred) <- levels(target)
+# Evaluate the model on the test set using confusion matrix
+xgb.con<-confusionMatrix(xgb.pred , target)
+
+#Auc
+xgb.auc= auc(target, xgb.probs)[1]
+```
+
+```{r}
+#accuracys 
+models<- c('Logistis Regression', 'Decision Tree',
+           'Random Forest', 'Xgb-Boast')
+Accuracies<- c(fit.con$overall[1], dt.con$overall[1],
+               rf.conf$overall[1], xgb.con$overall[1])
+F1_score<- c(fit.con$byClass[7], dt.con$byClass[7],
+             rf.conf$byClass[7], xgb.con$byClass[7])
+
+Auc_score= c(fit.auc, dt.auc,
+             rf.auc, xgb.auc)
+
+## final table 
+fina_table<- data.frame(Model= models,
+                        Accuracy= Accuracies,
+                        F1_score= F1_score,
+                        Auc_score=Auc_score)
+fina_table
+
+```
+
+```{r}
+# Extract feature importance values for Random Forest
+rf_importance <- varImp(rf_default)
+
+# Plot feature importance
+library(ggplot2)
+
+# Order the features by importance
+rf_importance_ordered <- rf_importance$importance[order(-rf_importance$importance[,1]), , drop = FALSE]
+
+# Create a dataframe for plotting
+importance_df <- data.frame(
+  Feature = rownames(rf_importance_ordered),
+  Importance = rf_importance_ordered$Overall
+)
+
+# Create the plot
+plot <- ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance, fill = Importance)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(x = "Feature", y = "Importance") +
+  ggtitle("Random Forest Feature Importance") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue")  # Change color gradient
+
+# Print the plot
+print(plot)
+
+```
+
+
+
